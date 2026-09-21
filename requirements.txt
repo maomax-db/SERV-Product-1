@@ -1,0 +1,7 @@
+# --- HTTP / web3 stack (Python 3.11) ---
+# requests: SERV Reasoning inference API (OpenAI Chat Completions wire-format).
+# web3:    Robinhood Chain RPC + wallet (EVM, Arbitrum Orbit L2).
+# Both are already installed on the dev machine — no install needed to run the
+# Sector 0 checks.
+requests>=2.31
+web3>=7.0.0
