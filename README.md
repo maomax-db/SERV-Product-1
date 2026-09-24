@@ -46,10 +46,10 @@ pip install -r requirements.txt
 |---------------|----------------------------------------------------|-------------------------------|
 | `agent-core/` | SERV/OpenServ API call logic                       | `serv.py` + config + test     |
 | `chain/`      | Robinhood Chain RPC + wallet read wrapper          | `wallet.py`, `rpc.py`, `schema.py`, `market.py`, `test_sector1.py` |
-| `execution/`  | DEX swap logic — *will be the only signer* (Sector 4) | empty                      |
-| `guardrail/`  | Guardrail & approval engine, kill switch (Sector 3)| empty                         |
+| `execution/`  | DEX swap logic — the only signer (Sector 4) | `executor.py` + `test_sector4.py` |
+| `guardrail/`  | Guardrail & approval engine, kill switch (Sector 3)| `engine.py`, `rules.py`, `approval.py`, `killswitch.py`, `dailytrades.py`, `logbook.py`, `test_sector3.py` |
 | `ui/`         | Audit dashboard (Sector 5)                         | empty                         |
-| `logs/`       | Audit log output                                   | empty                         |
+| `logs/`       | Audit log output                                   | `sector3_audit.jsonl`, `killswitch.json`, `daily_count_*.jsonl` (runtime) |
 
 ---
 
@@ -208,3 +208,219 @@ faucet claim). Cross-checkable live: explorer address link above, pool manager
 > Still decided by you (Sector 2 input): which pair should be the *demo target* —
 > tUSD/tRWA (liquid today) or a TSLA pair (needs liquidity to appear)? Sector 2
 > builds on top of `chain.schema`, so the choice is a config change, not a redesign.
+
+## Sector 2 status — proposal layer (agent-core/decision.py)
+
+**Gate: 10/10 checks pass (offline, deterministic, free).** Run:
+
+```powershell
+python agent-core/test_sector2.py
+```
+
+The Sector 1 gates covered **reading** the wallet; Sector 2 covers the exact
+moment a reasoning agent turns wallet+market data into a **trade proposal** —
+and does it with a typed, proposal-only contract that a third layer (Sector 3,
+approval/execution) can safely stand on. `decision.py` is exactly **451 lines**,
+imports nothing chain/sign/wallet/private-key, and exposes:
+
+```
+propose_trade(snapshot, market_quote, strategy=None, *, model=None, timeout=120)
+    -> DecisionResult
+```
+
+- `DecisionResult` = `ok, network, chain_id, block_number, model, proposed,
+  error, error_type, latency_ms, validation[], queried_at` + `error_result()`
+  + `to_dict()`. Never raises for bad SERV output — failures are **typed**
+  (`decision_schema_violation`, `constraint_violation`, `bad_input`,
+  `decision_parse_error`) so the next layer can route on the type.
+- `ProposedDecision` = `action, asset, size, confidence, rationale,
+  risk_flags[]` (typed). `rationale` is preserved **verbatim** from SERV — the
+  layer never fabricates a reason SERV didn't give.
+- Live SERV (testnet, real API key) verified end-to-end once: an honest
+  momentum-free `hold` was shaped into a clean typed proposal; a SERV
+  "temptation" toward a non-approved asset (`MOONSHOT`) and a filler/boilerplate
+  rationale were both **blocked** typed. The layer is proposal-only by
+  construction — it can never sign, broadcast, or touch a private key, so it
+  has no execution path for its own guardrails to accidentally skip.
+
+**What feeds the proposal (Sector 1 output, unchanged)**
+`chain.wallet.get_full_snapshot` / `chain.market.get_quote` → dictionaries whose
+field names the proposal layer already matches (verified live: Sub‑raw envelope
+using `amount`/`reason` instead of `size`/`rationale` is rejected on pass 1,
+and the *corrective retry* names the exact violations — exactly one retry, never
+a silent two‑step or a laundered envelope).
+
+## Sector 3 status — guardrail & approval engine (THE PRODUCT)
+
+**Gate: 8/8 checks pass (offline, deterministic, free).** Run:
+
+```powershell
+python guardrail/test_sector3.py
+```
+
+Sector 2 made the *proposal*; Sector 3 is where the actual product lives — the
+hard rule-checking wall between "SERV wants to do X" and "a real trade is
+authorized". Everything is verdict-only by construction: it can call SERV, read
+wallet state, and produce a typed approval verdict, but it never signs or
+broadcasts anything and imports nothing from a future execution/signing module.
+
+### Files
+
+| File | Contents |
+|---|---|
+| `guardrail/rules.py` | hard rules + `run_hard_rules` → list of `RuleCheck` |
+| `guardrail/engine.py` | `Guardrail` (guarded → approve), `ApprovalVerdict`, default policy, `verdict_to_log_row` |
+| `guardrail/approval.py` | `format_decision` (CLI proposal card) + `prompt_approval` (y/n) |
+| `guardrail/killswitch.py` | `KillSwitch` — file-based panic switch |
+| `guardrail/dailytrades.py` | `DailyCount` — per-day approved-trade counter |
+| `guardrail/logbook.py` | `AuditLog` — append-only JSONL log writer |
+
+### Guardrail rule set (applied BEFORE any approval)
+
+| Rule | Policy key | Default | Meaning |
+|---|---|---|---|
+| R1 approved-token list | `approved` | tUSD, tRWA, TSLA, WETH | nothing else is ever approval-eligible (redundant with Sector 2 on purpose) |
+| R2 max position size | `max_position_pct` (0.40) | ≤40% of wallet per asset | `:9000` example — 90% of a 10k wallet — blocked |
+| R3 max % per single trade | `max_trade_pct_of_wallet` (0.20) | ≤20% of wallet per trade | steady-state position-share view |
+| R4 max daily trade count | `max_daily_trades` (8) | per UTC day, persistent | capped trades push the counter to the cap → blocked |
+| R5 max slippage | `max_slippage_bps` (100) | 1.00% worst-case vs quote | compares quote amount-out vs expected |
+
+A `hold` short-circuits to all-rules-pass (holds take no position and no daily
+slot). Failed blocks are **typed** (`rule_position_size`, `rule_daily_count`,
+`rule_approved_list`, …) so the log and dashboards can route on the type.
+
+### Approval flow (no auto-approve anywhere)
+
+1. **Kill switch** is checked *first* — armed → everything is `killed` at once,
+   before any rule, and re-checked again at approval time so a mid-flight arm
+   still blocks an otherwise-passing proposal.
+2. **Hard rules** run; first failure → `V_BLOCKED` (typed). Held for review:
+   confidence below `confidence_floor` (0.85) → `V_HOLD` — never approval-eligible.
+3. Above the floor and all rules green → `V_PENDING` → **CLI prompt**: asset,
+   size, rationale, confidence, every check pass/fail. Only an explicit `y`
+   approves (`V_APPROVED`). Rejected or unanswered → `V_REJECTED`. There is **no
+   silent default-approve path**; the sole exception is a pre-declared
+   `autopilot_ok: true` policy flag (default `false`), and even that path first
+   passes the pending check — it can never upgrade a blocked/held verdict.
+
+### Kill switch
+
+Single file flag. One call arms everything downstream:
+
+```powershell
+python -c "from guardrail.killswitch import KillSwitch; KillSwitch().arm(reason='operator panic')"
+```
+
+- Default location `logs/killswitch.json`. `arm(...)` / `disarm()` / `is_armed()`.
+- Every `Guardrail.guarded()` and `approve_or_blocked()` call checks it; armed
+  ⇒ `V_KILLED` (`kill_switch`) for every proposal, no exceptions — the gate
+  proves a flawless rule-passing trade is killed the instant it's armed.
+
+### Structured audit log
+
+Every decision writes one JSONL row to **`logs/sector3_audit.jsonl`** (append-only),
+covering blocked / held / pending / approved / rejected / killed:
+
+```
+event, verdict, ok, asset, size, confidence, rationale, risk_flags,
+blocked_by, error_type, error, affected_rule, timestamp_utc, approved_at,
+network, chain_id, block_number, model, latency_ms
+```
+
+Daily trade counts persist to `logs/daily_count_<YYYY-MM-DD>.jsonl` (append-only);
+kill-switch state lives in `logs/killswitch.json`. All three are git-ignored
+runtime state under `/logs/`.
+
+### Gate checklist (all offline, near-instant, deterministic)
+
+1. 10 synthetic Sector-2 proposals: 7 good (5 trades + 2 holds) reach the
+   approval step; 3 bad — buy tUSD **9000** (90% of wallet → `rule_position_size`),
+   buy tRWA at **approved_today already at the daily cap** (`rule_daily_count`),
+   buy **MOONSHOT** (non-approved → `rule_approved_list`) — are all typed-blocked.
+2. Kill switch tested **mid-flow**: pre-arm proposals finish normally, armed ⇒
+   every proposal afterwards (incl. a flawless one) is `killed`.
+3. Every decision produced a log row with all required fields (22 rows swept,
+   0 missing).
+4. Avg proposal→approval latency < 5 ms.
+5. Construction discipline: `/guardrail/` AST-scanned — imports nothing from a
+   future `execution` module and nothing signing/wallet/private-key/web3-broadcast
+   (68 import names, leaks = none).
+
+## Sector 4 status — execution layer (THE ONLY SIGNER)
+
+**Gate: 15/15 checks pass (offline, deterministic, free).** Run:
+
+```powershell
+python execution/test_sector4.py
+```
+
+Sector 3 authorized the *decision*; Sector 4 is the only code path in the repo
+that can sign and broadcast a transaction. It is type-gated at the interface:
+`execute_trade()` accepts **only an already-approved `ApprovalVerdict`** — a raw
+dict, a Sector 2 `DecisionResult`, or any non-`approved` verdict is refused with
+a typed error *before any RPC connection* is even attempted.
+
+### Files
+
+| File | Contents |
+|---|---|
+| `execution/executor.py` | `execute_trade(approved)` → typed `ExecutionResult`; `build_swap_calldata`, `extract_token_totals`, `reconcile` |
+| `execution/test_sector4.py` | 15-check offline gate + live branch (gated on funding + human confirm) |
+
+### The live path it signs (verified against real on-chain swap txs)
+
+The pool manager's dealer router
+(`0x43a224f4a565a466015eb7bfb41d5ec268dcd72c`) takes a 14-word calldata
+(`0xa23089b3`) whose first two args are **always the pool's sorted token pair**
+(currency0/currency1 = tUSD, tRWA) — direction is carried solely by arg 7
+(`zeroForOne`: 1 = sell tUSD, 0 = sell tRWA). The encoder was verified
+**byte-for-byte against 20/20 live on-chain swaps** (both directions).
+
+### The execution pipeline (every branch returns a typed `ExecutionResult`)
+
+1. **Type gate** — input must be `ApprovalVerdict` (else `unauthorized_type`,
+   before any web3 access).
+2. **Verdict gate** — only `V_APPROVED` proceeds (`not_approved` otherwise).
+3. **Direction resolve** — buy tUSD→asset (`zeroForOne=1`), sell asset→tUSD
+   (`zeroForOne=0`); the tUSD/tRWA pair is the executable one.
+4. **Kill switch re-checked** — *before* any web3/RPC/signing access; armed ⇒
+   `kill_switch` abort even for an already-approved verdict.
+5. **Fresh live quote at execution time** — re-quoted vs the *approved*
+   expected output; ≥1% (`slippage_bps`) worse ⇒ `slippage_abort` **before
+   signing** (injected-quote test proves a 5% bad quote never signs).
+6. **Allowance + sign + broadcast (testnet only)** — approves the dealer, signs
+   with the `PRIVATE_KEY` from `.env`, waits for the receipt.
+7. **Reconciliation** — the receipt's real `Transfer` logs are parsed with
+   `extract_token_totals` and compared against the expected fill; a fake/zero
+   fill is caught as a `reconciliation` error.
+
+### Sector 4 findings that changed the design (honest, chain-verified)
+
+- **The uniswap "no-limit" sentinel is rejected by this pool for sells.**
+  Live swap samples carry `0x1000276a4` in the `sqrtPriceLimitX96` slot when
+  `zeroForOne=1` (sell tUSD), and the true sentinel for buys. The encoder now
+  defaults **direction-aware**: `0x1000276a4` for sells, sentinel for buys —
+  mirroring mined transactions, and the state-override simulate confirmed the
+  sentinel reverts (`0x7c9c6e8f`) on this pool while `0x1000276a4` succeeds.
+- **Dry-run confirmed end-to-end without funds:** using the real allowance a
+  funded testnet address already holds, a simulated `eth_simulateV1`
+  approve→swap produced the full Transfer chain
+  (wallet → dealer → pool → wallet) at the exact prices the encoder predicted
+  (20 tUSD in ≈ 0.198 tRWA out, zero slippage at 1 raw min-out).
+
+### Gate checklist (offline; the live branch is skipped until funded)
+
+1. Encoder reproduces a captured live dealer swap **byte-for-byte**
+   (the fixture is the real chain `input` hex, not hand-tuned).
+2. Calldata shape: `0xa23089b3` + 14 ABI words; direction-aware default via
+   the sentinel vs `0x1000276a4`.
+3. Refuses raw dict + raw `DecisionResult` (`unauthorized_type`), and all 5
+   non-approved verdicts (`not_approved`) — before any web3.
+4. Armed kill switch aborts at execution time (pre-web3).
+5. Injected 5%-worse quote aborts at `slippage_abort` before signing.
+6. Matching/30%-short/zero fills all reconcile correctly; receipt `Transfer`
+   parsing is exercised on a synthetic receipt.
+7. `/execution/` contains no literal private key (the actual `PRIVATE_KEY`
+   value from config is checked, not a hex heuristic).
+8. Live branch runs **only** when the wallet holds real tUSD/tRWA **and** a
+   human answers `yes` — else it prints a skip note and exits 0.
