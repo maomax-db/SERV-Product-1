@@ -271,9 +271,11 @@ function renderEntry(r) {
         (r.asset_in || "?") + " → received " +
         (r.size !== undefined ? r.size : "?") + " " + (r.asset || "?")));
   } else {
-    const action = (r.action || "?").toLowerCase();
-    row1.appendChild(el("span", "action",
-                        DECISION_LABEL[action] || r.action || "?"));
+    const action = (r.action || "").toLowerCase();
+    if (action) {
+      row1.appendChild(el("span", "action",
+                          DECISION_LABEL[action] || r.action));
+    }
     if (r.asset_in && r.asset_in !== r.asset) {
       row1.appendChild(el("span", "action", "Sell " + r.asset_in + " " +
                           (r.size_in !== undefined ? r.size_in : "")));
