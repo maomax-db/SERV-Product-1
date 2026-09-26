@@ -1,4 +1,4 @@
-"""Environment configuration for SERV Guardrail.
+"""Environment configuration for Weryon (Product #1 — Guardrail & Audit Layer).
 
 Loads settings from the process environment and, failing that, from a local
 `.env` file at the repo root (no third-party dependency required). Real values

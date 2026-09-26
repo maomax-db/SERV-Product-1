@@ -403,6 +403,9 @@ def _build_and_sign_swap(verdict: ApprovalVerdict, w3: Web3,
     }
     if w3.eth.gas_price and int(w3.eth.gas_price) > 0:
         tx["gasPrice"] = int(w3.eth.gas_price)
+    print(f"[SECTOR4-SIGNING] signing swap for {acct.address} to "
+          f"{DEALER_ROUTER} (nonce={nonce}, chain_id={chain_id}, "
+          f"gas={gas}, calldata={calldata[:14]}...{calldata[-6:]})")
     signed = acct.sign_transaction(tx)
     signed_hex = signed.raw_transaction.hex()
     if not signed_hex.startswith("0x"):
@@ -466,6 +469,8 @@ def _ensure_allowance(w3: Web3, token_address: str, spender: str,
     }
     if w3.eth.gas_price and int(w3.eth.gas_price) > 0:
         tx["gasPrice"] = int(w3.eth.gas_price)
+    print(f"[SECTOR4-SIGNING] signing approve for {acct.address} "
+          f"spender={spender} token={token_address} amount={amount_raw}")
     signed = acct.sign_transaction(tx)
     raw = signed.raw_transaction.hex()
     if not raw.startswith("0x"):

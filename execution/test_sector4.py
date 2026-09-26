@@ -9,6 +9,11 @@ Sector 4 security contract structurally:
         20 recent on-chain samples in dev, both directions).
   [2] TYP: a raw Sector 2 DecisionResult (or anything not an ApprovalVerdict)
         is refused BEFORE any web3/RPC/quote — typed ``unauthorized_type``.
+  [2A] S3B: Sector 3's synthetic BAD proposals (oversized 90%-of-wallet trade
+        and non-approved token) are refused offline the same way — and the
+        [SECTOR4-SIGNING] markers (executor.py:406 swap / 472 approve) are
+        PROVEN unreachable on every rejection (stdout is captured and asserted
+        clean). Rejection site pinned: executor.py:508 (isinstance gate).
   [3] VET: a blocked / hold / killed / pending / human-rejected verdict is
         refused before signing — typed ``not_approved``, stage structural.
   [4] KIL: kill switch armed at execution time aborts before signing even a
@@ -20,6 +25,9 @@ Sector 4 security contract structurally:
   [7] SRC: construction discipline — execution imports nothing it must not
         (no unauthorised private-key handling outside config), and the PRIVATE
         KEY itself is never present in any source file.
+  [9] SIGN: ONLY an approved verdict ever reaches the signing markers — proved
+        with a stubbed w3 whose broadcast step is intercepted; the
+        [SECTOR4-SIGNING] print fires exactly once and nothing is sent.
 
   Plus the (optional) LIVE branch [8] runs one tiny real swap ONLY when the
   wallet is funded and the user types `yes` — else it prints a clean SKIP.
@@ -30,6 +38,8 @@ Run:  python execution/test_sector4.py
 from __future__ import annotations
 
 import ast as _ast
+import contextlib
+import io
 import sys
 import tempfile
 from pathlib import Path
@@ -68,6 +78,8 @@ except ImportError:  # pragma: no cover
 
 RESULTS: list = []
 
+SIGN_MARK = "[SECTOR4-SIGNING]"   # printed by executor right before signing
+
 TUSD = "0x43d412f25B2792895A5311689aB07E0E56fCb033"
 TRWA = "0x57f637b5b92ea47598fE2C5e0734E98800D0Cdda"
 
@@ -75,6 +87,24 @@ TRWA = "0x57f637b5b92ea47598fE2C5e0734E98800D0Cdda"
 def record(name, ok, detail=""):  # noqa: ANN001, ANN202
     RESULTS.append((name, bool(ok)))
     print(f"    [{'x' if ok else '!'}] {name}" + (f"  ({detail})" if detail else ""))
+
+
+def run_captured(fn):  # noqa: ANN001, ANN202
+    """Run ``fn`` with stdout redirected; return ``(result, captured_text)``.
+
+    If ``fn`` raises, the exception is re-raised AFTER the captured text is
+    stashed on the exception object (``exc.capture``) so a caller that expects
+    an abort (e.g. broadcast interception) can still inspect what printed.
+    """
+    buf = io.StringIO()
+    result = None
+    try:
+        with contextlib.redirect_stdout(buf):
+            result = fn()
+    except Exception as exc:  # noqa: BLE001
+        exc.capture = buf.getvalue()  # type: ignore[attr-defined]
+        raise
+    return result, buf.getvalue()
 
 
 # --------------------------------------------------------------------------- #
@@ -180,13 +210,20 @@ def main() -> int:  # noqa: ANN201
         # [2] Structural type gate — non-AttributeVerdict refused pre-RPC
         # ------------------------------------------------------------------ #
         print("\n--- [2] Structural type gate (raw DecisionResult / dict) ---")
-        r = X.execute_trade({"action": "buy", "asset": "tRWA", "size": 1.0,
-                             "confidence": 0.9, "rationale": "x" * 24},
-                            w3=_BoomW3())
+        r, cap = run_captured(
+            lambda: X.execute_trade({"action": "buy", "asset": "tRWA",
+                                     "size": 1.0, "confidence": 0.9,
+                                     "rationale": "x" * 24},
+                                    w3=_BoomW3()))
         record("plain dict refused before any web3 (typed)",
                r is not None and not r.ok and r.error_type == "unauthorized_type"
                and r.stage == "structural_reject",
                f"error_type={getattr(r, 'error_type', None)}")
+        record("no [SECTOR4-SIGNING] marker printed on the dict-reject path",
+               SIGN_MARK not in cap,
+               f"sign_marker_in_capture={'YES' if SIGN_MARK in cap else 'no'}")
+        print("        rejection site: execution/executor.py:508 "
+              "(isinstance gate) — before any RPC/quote/calldata")
         if HAVE_SECTOR2 and DecisionResult is not None:
             dr = DecisionResult(ok=True, network="testnet", chain_id=46630,
                                 block_number=1, model="gpt-5.4-mini",
@@ -195,14 +232,76 @@ def main() -> int:  # noqa: ANN201
                                     confidence=0.9,
                                     rationale="raw sector2 result bypass attempt",
                                     risk_flags=[]))
-            r2 = X.execute_trade(dr, w3=_BoomW3())
+            r2, cap2 = run_captured(
+                lambda: X.execute_trade(dr, w3=_BoomW3()))
             record("raw Sector 2 DecisionResult refused before any web3 (typed)",
                    r2 is not None and not r2.ok
                    and r2.error_type == "unauthorized_type",
                    f"error_type={getattr(r2, 'error_type', None)}")
+            record("no [SECTOR4-SIGNING] marker printed on DecisionResult reject",
+                   SIGN_MARK not in cap2,
+                   f"sign_marker_in_capture={'YES' if SIGN_MARK in cap2 else 'no'}")
         else:
             record("raw Sector 2 DecisionResult refused before any web3 (typed)",
                    True, "decision module not importable; dict case already proved")
+
+        # ------------------------------------------------------------------ #
+        # [2A] Sector 3 synthetic BAD proposals (oversized / non-approved token)
+        #      refused exactly the same way, no signing marker ever printed
+        # ------------------------------------------------------------------ #
+        print("\n--- [2A] Sector 3 BAD proposals refused offline (no signing) ---")
+        print("        Sector 3 hard rules would also BLOCK these; prove the "
+              "execute_trade gate still refuses first, typed, pre-RPC")
+        s3_bad = [
+            {"action": "buy", "asset": "tUSD", "size": 9000.0,
+             "confidence": 0.97, "rationale": "OVERSIZE: 90% of wallet in one trade",
+             "risk_flags": ["size_above_limit"]},
+            {"action": "buy", "asset": "MOONSHOT", "size": 10.0,
+             "confidence": 0.98, "rationale": "NON-APPROVED TOKEN - the temptation",
+             "risk_flags": []},
+        ]
+        s3_ok = True
+        for _i, _p in enumerate(s3_bad):
+            _r, _cap = run_captured(
+                lambda p=_p: X.execute_trade(dict(p), w3=_BoomW3()))
+            _pass = (_r is not None and not _r.ok
+                     and _r.error_type == "unauthorized_type"
+                     and _r.stage == "structural_reject"
+                     and SIGN_MARK not in _cap)
+            s3_ok = s3_ok and _pass
+            record(f"Sector 3 BAD proposal {_i + 1} ({_p['asset']}) refused "
+                   f"typed & no signing marker",
+                   _pass,
+                   f"error_type={getattr(_r, 'error_type', None)} "
+                   f"sign_marker={'YES' if SIGN_MARK in _cap else 'no'}")
+        if HAVE_SECTOR2 and DecisionResult is not None:
+            s3_bad_dr = []
+            for _p in s3_bad:
+                s3_bad_dr.append(DecisionResult(
+                    ok=True, network="testnet", chain_id=46630, block_number=1,
+                    model="fake-serv",
+                    proposed=ProposedDecision(**_p)))
+            dr_ok = True
+            for _i, _d in enumerate(s3_bad_dr):
+                _r, _cap = run_captured(
+                    lambda d=_d: X.execute_trade(d, w3=_BoomW3()))
+                _pass = (_r is not None and not _r.ok
+                         and _r.error_type == "unauthorized_type"
+                         and _r.stage == "structural_reject"
+                         and SIGN_MARK not in _cap)
+                dr_ok = dr_ok and _pass
+                record(f"S3 BAD as DecisionResult {_i + 1} seated in "
+                       f"(asset={_d.proposed.asset}) refused typed, no marker",
+                       _pass,
+                       f"error_type={getattr(_r, 'error_type', None)} "
+                       f"sign_marker={'YES' if SIGN_MARK in _cap else 'no'}")
+        else:
+            dr_ok = True
+        record("all Sector 3 BAD proposals refused before any signing "
+               "(dict + DecisionResult forms)",
+               s3_ok and dr_ok,
+               f"dict_cases={len(s3_bad)} decisionresult_cases="
+               f"{len(s3_bad) if HAVE_SECTOR2 and DecisionResult is not None else 0}")
 
         # ------------------------------------------------------------------ #
         # [3] Verdict gate — any non-approved verdict refused before signing
@@ -228,11 +327,15 @@ def main() -> int:  # noqa: ANN201
         ks = KillSwitch(path=ks_path)
         ks.arm(reason="gate test", source="sector4-gate")
         approved = _approved_verdict(tmpd, size=0.0002)
-        ex = X.execute_trade(approved, w3=_BoomW3(), kill_switch=ks)
+        ex, cap_kil = run_captured(
+            lambda: X.execute_trade(approved, w3=_BoomW3(), kill_switch=ks))
         record("armed kill switch aborts before any web3/signing",
                ex is not None and not ex.ok and ex.stage == "kill_switch_abort"
                and ex.error_type == "kill_switch",
                f"stage={getattr(ex, 'stage', None)} error_type={getattr(ex, 'error_type', None)}")
+        record("no [SECTOR4-SIGNING] marker printed on the kill-switch abort",
+               SIGN_MARK not in cap_kil,
+               f"sign_marker_in_capture={'YES' if SIGN_MARK in cap_kil else 'no'}")
         ks.disarm()
 
         # ------------------------------------------------------------------ #
@@ -272,16 +375,20 @@ def main() -> int:  # noqa: ANN201
         saved = XX._wallet.project_account
         XX._wallet.project_account = _stub_account
         try:
-            ex = X.execute_trade(approved, network="testnet",
-                                 max_slippage_bps=100,
-                                 quote_provider=bad_quote,
-                                 w3=stublist[0])
+            ex, cap_sip = run_captured(
+                lambda: X.execute_trade(approved, network="testnet",
+                                        max_slippage_bps=100,
+                                        quote_provider=bad_quote,
+                                        w3=stublist[0]))
         finally:
             XX._wallet.project_account = saved
         record("live quote >1% worse than approved -> abort before signing",
                ex is not None and not ex.ok and ex.stage == "slippage_abort"
                and ex.error_type == "slippage_exceeded",
                f"stage={getattr(ex, 'stage', None)} err={getattr(ex, 'error', None)[:60] if getattr(ex, 'error', None) else None}")
+        record("no [SECTOR4-SIGNING] marker printed on the slippage abort",
+               SIGN_MARK not in cap_sip,
+               f"sign_marker_in_capture={'YES' if SIGN_MARK in cap_sip else 'no'}")
 
         # ------------------------------------------------------------------ #
         # [6] Reconciliation catches a fake bad fill
@@ -374,6 +481,97 @@ def main() -> int:  # noqa: ANN201
                 except Exception as exc:  # noqa: BLE001
                     record("LIVE SWAP failed (network/edge case)", False,
                            f"{type(exc).__name__}: {exc}")
+
+        # ------------------------------------------------------------------ #
+        # [9] SIGN — only an APPROVED verdict ever reaches the signing marker;
+        #      the stub broadcast is intercepted so the gate stays offline
+        # ------------------------------------------------------------------ #
+        print("\n--- [9] Approved verdict DOES reach signing (intercept before broadcast) ---")
+        approved = _approved_verdict(tmpd, action="buy", asset="tRWA", size=0.0002,
+                                     quote=0.0002, expected=0.0002)
+
+        class _SignStub:  # noqa: D101
+            def __init__(self):
+                self.signed = 0
+
+        class _BroadcastStopped(Exception):  # noqa: D101
+            """Raised by the stub w3 in place of a real broadcast."""
+
+        signstub = _SignStub()
+
+        class _SignAcct:  # noqa: D101
+            address = "0x2170105c880B8a5782EDE8ec7B02465f9d3cd981"
+
+            def sign_transaction(self, tx):
+                signstub.signed += 1
+                return type("s", (), {"raw_transaction": type(
+                    "rt", (), {"hex": lambda self: "0x" + "11" * 32})()})()
+
+        class _SignW3:  # noqa: D101
+            def __init__(self):
+                self.eth = type("eth", (), {
+                    "chain_id": 46630, "block_number": 1, "gas_price": 0,
+                    "get_transaction_count": lambda self, addr: 1,
+                    "send_raw_transaction": lambda self, raw: _raise_bcast(),
+                    "estimate_gas": lambda self, tx: 500_000,
+                })()
+
+        def _raise_bcast():  # noqa: ANN202
+            raise _BroadcastStopped()
+
+        signw3 = _SignW3()
+
+        def good_quote(w3, token_in, token_out, amount_in_human):
+            from chain.schema import Quote  # noqa: PLC0415
+            return Quote(ok=True, network="testnet", chain_id=46630,
+                         block_number=1,
+                         token_in=token_in, token_out=token_out,
+                         amount_in_human=str(amount_in_human),
+                         amount_out_human="0.0002000",  # matches approved
+                         token_in_symbol="tUSD", token_out_symbol="tRWA")
+
+        import execution.executor as X9  # noqa: PLC0415, F811
+        _saved_proj = X9._wallet.project_account
+        _saved_dec = X9._decimals
+        _saved_allow = X9._ensure_allowance
+        _saved_gas = X9._estimate_gas
+
+        def _stub_proj(w3):
+            return _SignAcct()
+
+        def _stub_decimals(w3, token):
+            return 18
+
+        def _stub_allowance(w3, token, spender, amount):
+            return True
+
+        def _stub_gas(w3, acct, token_in, token_out, amount_in_raw, zfo):
+            return 500_000
+
+        X9._wallet.project_account = _stub_proj
+        X9._decimals = _stub_decimals
+        X9._ensure_allowance = _stub_allowance
+        X9._estimate_gas = _stub_gas
+        cap_sig = ""
+        try:
+            run_captured(
+                lambda: X.execute_trade(approved, network="testnet",
+                                        max_slippage_bps=100,
+                                        quote_provider=good_quote,
+                                        w3=signw3))
+        except _BroadcastStopped as exc:
+            cap_sig = getattr(exc, "capture", "")
+        finally:
+            X9._wallet.project_account = _saved_proj
+            X9._decimals = _saved_dec
+            X9._ensure_allowance = _saved_allow
+            X9._estimate_gas = _saved_gas
+
+        record("approved verdict DOES reach the signing marker once; stub "
+               "broadcast intercept proves nothing was sent",
+               SIGN_MARK in cap_sig and signstub.signed == 1,
+               f"sign_marker={'YES' if SIGN_MARK in cap_sig else 'no'} "
+               f"sign_calls={signstub.signed}")
 
     passed = sum(1 for _, ok in RESULTS if ok)
     print("\n" + "=" * 72)
