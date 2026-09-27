@@ -21,7 +21,7 @@ No product name yet, no features — just the problem.
 
 ### b. Show a BLOCKED trade first — the most important screen (≈50s)
 
-Open the dashboard: `python -m http.server 8000` → `http://localhost:8000/ui/`.
+Open the dashboard: `python -m http.server 8899` → `http://localhost:8899/ui/`.
 The timeline is chronological (oldest → newest), so find the **red** entries and
 zoom on one:
 
@@ -80,7 +80,7 @@ Agentic Trading.**
 ## Checklist before you record
 
 - [ ] `python ui/record_real_logs.py` ran and printed `Done: N rows ...` (N ≥ 15)
-- [ ] `python -m http.server 8000` serving, dashboard loads at `/ui/`
+- [ ] `python -m http.server 8899` serving, dashboard loads at `/ui/`
 - [ ] The blocked MOONSHOT / oversized / daily-cap cards show `rule_*` reasons
 - [ ] The approved card shows a rationale in plain English
 - [ ] The executed card shows the explorer link — clicking it opens the real tx

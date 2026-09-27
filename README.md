@@ -109,8 +109,8 @@ Verify the store: `python ui/record_real_logs.py --check`.
 Single HTML page, no framework, reads the real `logs/` files at runtime. Serve the repo root so the JSONL fetch works:
 
 ```powershell
-python -m http.server 8000
-# open http://localhost:8000/ui/
+python -m http.server 8899
+# open http://localhost:8899/ui/
 ```
 
 The dashboard shows the chronological timeline (proposed → approved / blocked / held / killed → executed), per-decision asset, size, confidence, the full plain-English rationale (verbatim from SERV), which rule blocked each trade, the kill-switch state, and an explorer link on the executed swap.
