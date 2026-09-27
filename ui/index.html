@@ -112,6 +112,46 @@
     font: 500 13px var(--mono); color: var(--verify);
   }
 
+  /* ---- live cycle controls ---- */
+  .controls { margin-top: 44px; }
+  .controls-title { font-size: 23px; font-weight: 600; }
+  .controls-kicker { margin-top: 2px; font: 400 12.5px var(--mono); color: var(--meta); }
+  .ctrl-row { margin-top: 16px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .btn {
+    font: 500 14px var(--sans); color: var(--ink);
+    background: var(--surface); border: 1px solid var(--hairline);
+    padding: 9px 18px; cursor: pointer;
+  }
+  .btn:hover { border-color: var(--ink); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn-approve { border-color: var(--verify); color: var(--verify); }
+  .btn-approve:hover { background: rgba(92, 141, 122, 0.12); }
+  .btn-reject { border-color: var(--signal); color: var(--signal); }
+  .btn-reject:hover { background: rgba(198, 69, 59, 0.12); }
+  .ctrl-status { font: 400 13px var(--mono); color: var(--meta); }
+  .panel {
+    margin-top: 18px; padding: 18px 20px;
+    background: var(--surface); border: 1px solid var(--hairline);
+    border-left: 3px solid var(--hairline);
+  }
+  .panel-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  .panel-verdict { font: 500 12px var(--mono); }
+  .panel-verdict.verdict-blocked, .panel-verdict.verdict-killed { color: var(--signal); }
+  .panel-verdict.verdict-approved { color: var(--verify); }
+  .panel-prop { font: 500 16px var(--mono); }
+  .p-rationale { margin-top: 12px; font-size: 15px; color: var(--ink); }
+  .p-checks { list-style: none; margin-top: 14px; border-top: 1px solid var(--hairline); }
+  .p-checks li {
+    display: flex; gap: 10px;
+    font: 500 12.5px var(--mono); padding: 7px 0;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .check-pass { color: var(--verify); font-weight: 500; }
+  .check-fail { color: var(--signal); font-weight: 500; }
+  .p-meta { margin-top: 12px; font: 400 12px var(--mono); color: var(--meta); }
+  .p-actions { margin-top: 16px; display: flex; gap: 12px; }
+  .p-note { margin-top: 12px; font: 400 12.5px var(--mono); color: var(--meta); }
+
   .error {
     margin-top: 20px; padding: 14px 18px;
     border: 1px solid var(--signal); border-left: 3px solid var(--signal);
@@ -150,6 +190,31 @@
 
   <div class="error" id="errorbox" style="display:none"></div>
 
+  <section class="controls" id="controls" aria-label="Live cycle controls">
+    <h2 class="controls-title">Live cycle</h2>
+    <p class="controls-kicker">propose a real trade to SERV, then approve or
+      reject it here — this page is view + approve only; nothing is signed or
+      broadcast from it</p>
+    <div class="ctrl-row">
+      <button id="btn-propose" type="button" class="btn">Propose a trade</button>
+      <span id="ctrl-status" class="ctrl-status" role="status" aria-live="polite"></span>
+    </div>
+    <div class="panel" id="panel" hidden>
+      <div class="panel-head">
+        <span id="p-verdict" class="panel-verdict"></span>
+        <span id="p-prop" class="panel-prop"></span>
+      </div>
+      <p id="p-rationale" class="p-rationale"></p>
+      <ul id="p-checks" class="p-checks"></ul>
+      <p id="p-wallet" class="p-meta"></p>
+      <div class="p-actions" id="p-actions" style="display:none">
+        <button id="btn-approve" type="button" class="btn btn-approve">Approve</button>
+        <button id="btn-reject" type="button" class="btn btn-reject">Reject</button>
+      </div>
+      <p id="p-note" class="p-note"></p>
+    </div>
+  </section>
+
   <section id="timeline" aria-label="Decision ledger">
     <h2 class="ledger-title">Decision ledger</h2>
     <p class="ledger-kicker">one verdict per row, oldest → newest — every row is a real logged decision</p>
@@ -180,6 +245,7 @@ const VERDICT_LABEL = {
   killed: "Killed",
   rejected_by_human: "Rejected",
   pending: "Requires approval",
+  requires_approval: "Requires approval",
   executed: "Executed",
 };
 
@@ -349,6 +415,28 @@ async function fetchLines(url) {
   return res.text();
 }
 
+function render(rows, ks) {
+  const tl = document.getElementById("verdicts");
+  tl.textContent = "";
+  document.getElementById("counts").textContent = "";
+  const ksb = document.getElementById("ks");
+  ksb.innerHTML = "";
+  ksb.classList.remove("ks-armed");
+
+  rows = rows.slice().sort((a, b) =>
+    String(a.timestamp_utc || "").localeCompare(String(b.timestamp_utc || "")));
+
+  const statusCount = {};
+  for (const r of rows) statusCount[r.verdict || "other"] =
+      (statusCount[r.verdict || "other"] || 0) + 1;
+  renderCounts(statusCount, rows.length);
+
+  if (ks && typeof ks === "object") renderKillSwitch(ks);
+
+  for (const r of rows) tl.appendChild(renderEntry(r));
+  if (rows.length === 0) showError("logs/sector3_audit.jsonl exists but is empty.");
+}
+
 async function load() {
   document.getElementById("counts").textContent = "";
 
@@ -364,24 +452,9 @@ async function load() {
     return;
   }
 
-  rows.sort((a, b) =>
-    String(a.timestamp_utc || "").localeCompare(String(b.timestamp_utc || "")));
-
-  const statusCount = {};
-  for (const r of rows) statusCount[r.verdict || "other"] =
-      (statusCount[r.verdict || "other"] || 0) + 1;
-
-  renderCounts(statusCount, rows.length);
-
-  // Kill switch state (real file).
-  try {
-    const ks = JSON.parse(await fetchLines(KS_FILE));
-    if (typeof ks === "object" && ks !== null) renderKillSwitch(ks);
-  } catch (e) { /* optional; skip without noise */ }
-
-  const tl = document.getElementById("verdicts");
-  for (const r of rows) tl.appendChild(renderEntry(r));
-  if (rows.length === 0) showError("logs/sector3_audit.jsonl exists but is empty.");
+  let ks = null;
+  try { ks = JSON.parse(await fetchLines(KS_FILE)); } catch (e) { /* optional */ }
+  render(rows, ks);
 
   document.getElementById("footer").textContent =
       "Data source: " + LOG_FILE + " (append-only, one JSON line per decision) — "
@@ -389,6 +462,149 @@ async function load() {
       "one executed row is the real transaction 0x31098934…c3064 on Robinhood "
       "Chain testnet.";
 }
+
+// ---------------------------------------------------------------------------
+// Live cycle: propose -> (Approve/Reject) -> auto refresh. View + approve
+// only; the server never exposes signing.
+// ---------------------------------------------------------------------------
+let currentProposalId = null;
+
+async function postJSON(url, body) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error((data && data.error) || ("HTTP " + res.status));
+  return data;
+}
+
+function setStatus(msg) {
+  document.getElementById("ctrl-status").textContent = msg || "";
+}
+
+function renderProposal(d) {
+  const panel = document.getElementById("panel");
+  panel.hidden = false;
+
+  const pv = document.getElementById("p-verdict");
+  pv.className = "panel-verdict verdict-" + (d.verdict || "other");
+  pv.textContent = (VERDICT_LABEL[d.verdict] || d.verdict || "?")
+      + (d.error ? " — " + d.error : "");
+
+  const dec = d.decision || {};
+  document.getElementById("p-prop").textContent = [
+    DECISION_LABEL[dec.action] || dec.action || "hold",
+    dec.asset || "",
+    dec.size ? "size " + dec.size : "",
+    "conf " + Number(dec.confidence || 0).toFixed(2),
+  ].join("  ");
+
+  document.getElementById("p-rationale").textContent = dec.rationale || "";
+
+  const ul = document.getElementById("p-checks");
+  ul.textContent = "";
+  for (const c of (d.hard_checks || [])) {
+    const li = document.createElement("li");
+    const st = document.createElement("span");
+    st.className = c.ok ? "check-pass" : "check-fail";
+    st.textContent = c.ok ? "PASS" : "FAIL";
+    li.appendChild(st);
+    li.appendChild(document.createTextNode(" " + c.rule + " — " + c.detail));
+    ul.appendChild(li);
+  }
+  if (d.confidence_floor !== undefined) {
+    const li = document.createElement("li");
+    const st = document.createElement("span");
+    const ok = Number(dec.confidence || 0) >= Number(d.confidence_floor);
+    st.className = ok ? "check-pass" : "check-fail";
+    st.textContent = ok ? "PASS" : "FAIL";
+    li.appendChild(st);
+    li.appendChild(document.createTextNode(
+        " confidence_floor — " + Number(dec.confidence || 0).toFixed(2) +
+        " >= floor " + Number(d.confidence_floor).toFixed(2)));
+    ul.appendChild(li);
+  }
+
+  const w = d.wallet || {};
+  document.getElementById("p-wallet").textContent = [
+    "wallet " + (w.address ? w.address.slice(0, 8) + "…" : "?") +
+      (w.value !== undefined ? " — value " + Number(w.value).toFixed(2) + " tUSD" : "") +
+      (w.funding_fallback ? " (demo funding base)" : ""),
+    d.daily ? "daily " + d.daily.approved_today + "/" + d.daily.max + " approved" : "",
+    "kill switch " + (d.kill_switch ? "ARMED" : "off"),
+  ].filter(Boolean).join("   ·   ");
+
+  const pending = d.verdict === "requires_approval";
+  document.getElementById("p-actions").style.display = pending ? "flex" : "none";
+  document.getElementById("p-note").textContent = pending
+      ? "PASSED every hard rule — Approve or Reject. Nothing is signed or broadcast from this page."
+      : "NOT presented for approval (verdict: " + (d.verdict || "?") + "). Nothing was auto-approved.";
+}
+
+async function doPropose() {
+  const btn = document.getElementById("btn-propose");
+  btn.disabled = true;
+  setStatus("asking SERV — snapshot + quote + hard rules may take several seconds …");
+  try {
+    const d = await postJSON("/api/propose", {});
+    currentProposalId = d.proposal_id || null;
+    renderProposal(d);
+    setStatus(d.ok ? "" : (d.error || "propose returned an error"));
+  } catch (e) {
+    currentProposalId = null;
+    setStatus("proposal failed — " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function decide(choice) {
+  if (!currentProposalId) { setStatus("no pending proposal — click Propose first."); return; }
+  const pid = currentProposalId;
+  setStatus(choice === "approve" ? "logging approval …" : "logging rejection …");
+  try {
+    const d = await postJSON("/api/approve", { proposal_id: pid, decision: choice });
+    currentProposalId = null;
+    const pv = document.getElementById("p-verdict");
+    pv.className = "panel-verdict verdict-" + d.final.verdict;
+    pv.textContent = "Final verdict: " + (VERDICT_LABEL[d.final.verdict] || d.final.verdict);
+    document.getElementById("p-actions").style.display = "none";
+    document.getElementById("p-note").textContent =
+        "Logged to the audit ledger" + (d.daily_pending !== undefined
+          ? " — daily count now " + d.daily_pending + "/8" : "") +
+        ". View + approve only — nothing signed or broadcast.";
+    setStatus("");
+    await refreshLedger();
+  } catch (e) {
+    setStatus("approval failed — " + e.message);
+  }
+}
+
+async function refreshLedger() {
+  try {
+    const res = await fetch("/api/ledger");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    render(data.rows || [], data.killswitch);
+    document.getElementById("footer").textContent =
+        "Refreshed " + new Date().toISOString().replace("T", " ").slice(0, 19) +
+        " UTC — /api/ledger (live append-only audit log).";
+    return;
+  } catch (e) { /* fall back to a plain file refetch */ }
+  try {
+    const text = await fetchLines(LOG_FILE);
+    const rows = text.split("\n").filter(l => l.trim().length).map(l => JSON.parse(l));
+    let ks = null;
+    try { ks = JSON.parse(await fetchLines(KS_FILE)); } catch (e2) { /* optional */ }
+    render(rows, ks);
+  } catch (e) { showError("ledger refresh failed — " + e.message); }
+}
+
+document.getElementById("btn-propose").addEventListener("click", doPropose);
+document.getElementById("btn-approve").addEventListener("click", () => decide("approve"));
+document.getElementById("btn-reject").addEventListener("click", () => decide("reject"));
 
 window.addEventListener("DOMContentLoaded", load);
 </script>
